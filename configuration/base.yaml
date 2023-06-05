@@ -11,3 +11,4 @@ email_client:
   sender_email: "testmail@test.com"
   api_token: "my-api-token"
   secret_token: "my-secret-api-token"
+  timeout_milliseconds: 10000
