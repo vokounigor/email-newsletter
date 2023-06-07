@@ -1,5 +1,5 @@
 use actix_web::{web, HttpResponse};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 #[derive(serde::Deserialize)]
@@ -16,7 +16,28 @@ pub async fn confirm(parameters: web::Query<Parameters>, pool: web::Data<PgPool>
     match id {
         None => HttpResponse::Unauthorized().finish(),
         Some(subscriber_id) => {
-            if confirm_subscriber(subscriber_id, &pool).await.is_err() {
+            if is_user_confirmed(subscriber_id, &pool).await {
+                return HttpResponse::Ok().finish();
+            }
+            let mut transaction = match pool.begin().await {
+                Ok(transaction) => transaction,
+                Err(_) => return HttpResponse::InternalServerError().finish(),
+            };
+            if confirm_subscriber(subscriber_id, &mut transaction)
+                .await
+                .is_err()
+            {
+                return HttpResponse::InternalServerError().finish();
+            }
+
+            if delete_old_token(subscriber_id, &mut transaction)
+                .await
+                .is_err()
+            {
+                return HttpResponse::InternalServerError().finish();
+            }
+
+            if transaction.commit().await.is_err() {
                 return HttpResponse::InternalServerError().finish();
             }
             HttpResponse::Ok().finish()
@@ -42,17 +63,58 @@ pub async fn get_subscriber_id_from_token(
     Ok(result.map(|r| r.subscriber_id))
 }
 
-#[tracing::instrument(name = "Mark subscriber as confirmed", skip(subscriber_id, pool))]
-pub async fn confirm_subscriber(subscriber_id: Uuid, pool: &PgPool) -> Result<(), sqlx::Error> {
+#[tracing::instrument(
+    name = "Mark subscriber as confirmed",
+    skip(subscriber_id, transaction)
+)]
+pub async fn confirm_subscriber(
+    subscriber_id: Uuid,
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<(), sqlx::Error> {
     sqlx::query!(
         r#"UPDATE subscriptions SET status = 'confirmed' WHERE id = $1"#,
         subscriber_id
     )
-    .execute(pool)
+    .execute(transaction)
     .await
     .map_err(|e| {
         tracing::error!("Failed to execute query {:?}", e);
         e
     })?;
     Ok(())
+}
+
+#[tracing::instrument(
+    name = "Deleting old token from subscription_tokens",
+    skip(subscriber_id, transaction)
+)]
+pub async fn delete_old_token(
+    subscriber_id: Uuid,
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        "DELETE FROM subscription_tokens WHERE subscriber_id = $1",
+        subscriber_id
+    )
+    .execute(transaction)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to execute query {:?}", e);
+        e
+    })?;
+    Ok(())
+}
+
+#[tracing::instrument(
+    name = "Checking if user is already confirmed",
+    skip(subscriber_id, pool)
+)]
+pub async fn is_user_confirmed(subscriber_id: Uuid, pool: &PgPool) -> bool {
+    sqlx::query!(
+        "SELECT status FROM subscriptions WHERE id = $1 AND status = 'confirmed'",
+        subscriber_id
+    )
+    .fetch_one(pool)
+    .await
+    .is_ok()
 }
