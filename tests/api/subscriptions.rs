@@ -78,7 +78,7 @@ async fn subscribe_returns_a_400_when_fields_are_present_but_invalid() {
         assert_eq!(
             400,
             response.status().as_u16(),
-            "The API did not return a 200 OK when the payload was {}.",
+            "The API did not return a 400 Bad Request when the payload was {}.",
             description
         );
     }
@@ -121,4 +121,22 @@ async fn subscribe_sends_a_confirmation_email_with_a_link() {
 
     // The two links should be identical
     assert_eq!(confirmation_links.html, confirmation_links.plain_text);
+}
+
+#[tokio::test]
+async fn subscribe_fails_if_there_is_a_fatal_database_error() {
+    // Arrange
+    let app = spawn_app().await;
+    let body = "name=mr%20test&email=mr_t%40test.com";
+    // Sabotage the database
+    sqlx::query!("ALTER TABLE subscription_tokens DROP COLUMN subscription_token;")
+        .execute(&app.db_pool)
+        .await
+        .unwrap();
+
+    // Act
+    let response = app.post_subscriptions(body.into()).await;
+
+    // Assert
+    assert_eq!(response.status().as_u16(), 500);
 }
