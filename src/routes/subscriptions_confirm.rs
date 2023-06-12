@@ -1,4 +1,6 @@
-use actix_web::{web, HttpResponse};
+use actix_web::{web, HttpResponse, ResponseError};
+use anyhow::Context;
+use reqwest::StatusCode;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
@@ -7,40 +9,55 @@ pub struct Parameters {
     subscription_token: String,
 }
 
+#[derive(thiserror::Error)]
+pub enum SubscribeConfirmError {
+    #[error(transparent)]
+    UnexpectedError(#[from] anyhow::Error),
+}
+
+impl std::fmt::Debug for SubscribeConfirmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        error_chain_fmt(self, f)
+    }
+}
+
+impl ResponseError for SubscribeConfirmError {
+    fn status_code(&self) -> reqwest::StatusCode {
+        match self {
+            SubscribeConfirmError::UnexpectedError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
 #[tracing::instrument(name = "Confirm a pending subscriber", skip(parameters, pool))]
-pub async fn confirm(parameters: web::Query<Parameters>, pool: web::Data<PgPool>) -> HttpResponse {
-    let id = match get_subscriber_id_from_token(&parameters.subscription_token, &pool).await {
-        Ok(id) => id,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
-    };
+pub async fn confirm(
+    parameters: web::Query<Parameters>,
+    pool: web::Data<PgPool>,
+) -> Result<HttpResponse, SubscribeConfirmError> {
+    let id = get_subscriber_id_from_token(&parameters.subscription_token, &pool)
+        .await
+        .context("Error finding subscriber from token")?;
     match id {
-        None => HttpResponse::Unauthorized().finish(),
+        None => Ok(HttpResponse::Unauthorized().finish()),
         Some(subscriber_id) => {
             if is_user_confirmed(subscriber_id, &pool).await {
-                return HttpResponse::Ok().finish();
+                return Ok(HttpResponse::Ok().finish());
             }
-            let mut transaction = match pool.begin().await {
-                Ok(transaction) => transaction,
-                Err(_) => return HttpResponse::InternalServerError().finish(),
-            };
-            if confirm_subscriber(subscriber_id, &mut transaction)
+            let mut transaction = pool
+                .begin()
                 .await
-                .is_err()
-            {
-                return HttpResponse::InternalServerError().finish();
-            }
-
-            if delete_old_token(subscriber_id, &mut transaction)
+                .context("Fialed to acquire a Postgres connection from the pool")?;
+            confirm_subscriber(subscriber_id, &mut transaction)
                 .await
-                .is_err()
-            {
-                return HttpResponse::InternalServerError().finish();
-            }
-
-            if transaction.commit().await.is_err() {
-                return HttpResponse::InternalServerError().finish();
-            }
-            HttpResponse::Ok().finish()
+                .context("Failed to set subscriber status to confirmed")?;
+            delete_old_token(subscriber_id, &mut transaction)
+                .await
+                .context("Failed to delete old subscriber token")?;
+            transaction
+                .commit()
+                .await
+                .context("Failed to commit SQL transaction to confirm user")?;
+            Ok(HttpResponse::Ok().finish())
         }
     }
 }
@@ -55,11 +72,7 @@ pub async fn get_subscriber_id_from_token(
         subscription_token
     )
     .fetch_optional(pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to execute query {:?}", e);
-        e
-    })?;
+    .await?;
     Ok(result.map(|r| r.subscriber_id))
 }
 
@@ -76,11 +89,7 @@ pub async fn confirm_subscriber(
         subscriber_id
     )
     .execute(transaction)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to execute query {:?}", e);
-        e
-    })?;
+    .await?;
     Ok(())
 }
 
@@ -97,11 +106,7 @@ pub async fn delete_old_token(
         subscriber_id
     )
     .execute(transaction)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to execute query {:?}", e);
-        e
-    })?;
+    .await?;
     Ok(())
 }
 
@@ -117,4 +122,17 @@ pub async fn is_user_confirmed(subscriber_id: Uuid, pool: &PgPool) -> bool {
     .fetch_one(pool)
     .await
     .is_ok()
+}
+
+fn error_chain_fmt(
+    e: &impl std::error::Error,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    writeln!(f, "{}\n", e)?;
+    let mut current = e.source();
+    while let Some(cause) = current {
+        writeln!(f, "Caused by:\n\t{}", cause)?;
+        current = cause.source();
+    }
+    Ok(())
 }
